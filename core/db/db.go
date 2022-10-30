@@ -8,7 +8,79 @@ import (
 	"github.com/ipfs/go-ipld-format"
 	ulid "github.com/oklog/ulid/v2"
 )
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"expvar"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
+	"github.com/dgraph-io/badger/v3/options"
+	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/dgraph-io/badger/v3/skl"
+	"github.com/dgraph-io/badger/v3/table"
+	"github.com/dgraph-io/badger/v3/y"
+	"github.com/dgraph-io/ristretto"
+	"github.com/dgraph-io/ristretto/z"
+	humanize "github.com/dustin/go-humanize"
+	"github.com/pkg/errors"
+)
+
+var (
+	badgerPrefix = []byte("!badger!")       // Prefix for internal keys used by badger.
+	txnKey       = []byte("!badger!txn")    // For indicating end of entries in txn.
+	bannedNsKey  = []byte("!badger!banned") // For storing the banned namespaces.
+)
+
+const (
+	maxNumSplits = 128
+)
+
+type closers struct {
+	updateSize  *z.Closer
+	compactors  *z.Closer
+	memtable    *z.Closer
+	writes      *z.Closer
+	valueGC     *z.Closer
+	pub         *z.Closer
+	cacheHealth *z.Closer
+}
+
+type lockedKeys struct {
+	sync.RWMutex
+	keys map[uint64]struct{}
+}
+
+func (lk *lockedKeys) add(key uint64) {
+	lk.Lock()
+	defer lk.Unlock()
+	lk.keys[key] = struct{}{}
+}
+
+func (lk *lockedKeys) has(key uint64) bool {
+	lk.RLock()
+	defer lk.RUnlock()
+	_, ok := lk.keys[key]
+	return ok
+}
+
+func (lk *lockedKeys) all() []uint64 {
+	lk.RLock()
+	defer lk.RUnlock()
+	keys := make([]uint64, 0, len(lk.keys))
+	for key := range lk.keys {
+		keys = append(keys, key)
+	}
+	return keys
+}
 const (
 	// EmptyInstanceID represents an empty InstanceID.
 	EmptyInstanceID = InstanceID("")
